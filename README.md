@@ -1,107 +1,103 @@
 <div align="center">
 
-<img src="docs/assets/img/drag.gif" alt="窗口被拖动，逐帧由 QuickDraw 引擎渲染" width="460">
+<img src="docs/assets/hero.jpg" alt="Mosaintosh — A Macintosh in your pocket." width="900">
 
-# MosaiMac
+# Mosaintosh
 
-**QuickDraw for ESP32-S31**
+**A Macintosh in your pocket.**
 
-1984 年 Macintosh 的 1-bit 图形核心（BitBlt、Region、GrafPort），重写为可移植 C11，跑在 ESP-Mosaico 的 480×480 CO5300 上。
+在 ESP-Mosaico 上运行真正的 Macintosh Plus ROM 与 System 7.5.3。
 
-[![ESP32-S31](https://img.shields.io/badge/chip-ESP32--S31-ff5a1f?style=flat-square)](https://www.espressif.com/en/products/socs/esp32-s31)
-[![tests](https://img.shields.io/badge/tests-3124_passing-5cb85c?style=flat-square)](test)
-[![License](https://img.shields.io/badge/license-Apache--2.0-f1e8d8?style=flat-square)](LICENSE)
-
-[项目主页](https://hkgood.github.io/MosaiMac/) · [设计决策与实测](docs/DESIGN.md) · [English](README.en.md)
+[项目主页](https://hkgood.github.io/Mosaintosh/) · [第三方许可](THIRD_PARTY.md)
 
 </div>
 
 ---
 
-## 构建
+Mosaintosh 把一台 4 MB Macintosh Plus 搬到 ESP32-S31：480×480 CO5300
+触摸屏显示 416×416 的 1-bit Mac 桌面，手指直接作为鼠标。模拟器基于
+[umac](https://github.com/evansm7/umac)，68000 CPU 核心来自 Musashi。
 
-**主机** — 不需要硬件
+<p align="center">
+  <img src="docs/assets/desktop.png" alt="System 7.5.3 Finder desktop" width="360">
+  <img src="docs/assets/about.png" alt="About This Macintosh showing System 7.5.3" width="360">
+</p>
+
+## 特性
+
+- 真正的 Mac Plus v3 ROM 与 System Software 7.5.3，不是仿制界面。
+- 4 MB Mac 内存，System 7 以 1.00× 实时速度运行。
+- 416×416 显示区域完整避开 ESP-Mosaico 圆角，并保留菜单栏与桌面四角。
+- 触摸映射为绝对定位鼠标；边框触摸自动贴到最近的 Mac 屏幕边缘。
+- 逐行比较 1-bit 帧缓冲，只把变化区域转换为 RGB565 并推送到面板。
+- 启动盘从只读 flash 映射；运行时写入进入 2 MB PSRAM 写时复制层，重启即清空。
+- 同一份固件源码可在 macOS 板级模拟器中启动、交互并逐像素验证。
+
+## ROM 与系统盘
+
+仓库不包含、也不会分发 Apple ROM 或系统软件。请使用你合法拥有的镜像，并放入
+已被 Git 忽略的 `assets/`：
+
+```text
+assets/MacPlus-v3.rom   128 KB Mac Plus v3 ROM，校验和 4D1F8172
+assets/System.img       可启动的原始 HFS 卷，System 7.5.3
+```
+
+## 在 macOS 上验证
+
+首次裁剪系统盘需要 Python 的 `machfs`：
 
 ```sh
-make test     # 1509 + 1615 checks
-make bench    # 吞吐测量
-make asan     # ASan + UBSan
-make sim      # 无头模拟器，60 步拖动逐像素校验
-make sim-asan # 同上，ASan + UBSan + LeakSan
-make render   # 重新生成静态截图
-make replay   # 重新生成上面的拖动动画
+python3 -m venv build/venv
+build/venv/bin/pip install machfs
+
+make disk          # 生成并启动验证 10/8/6 MB 三种系统盘
+make board         # 启动到 Finder，触摸打开“About This Macintosh”
+make board-window  # 打开交互式 Cocoa 窗口，鼠标模拟触摸
+make boot          # 纯主机启动，每 5 秒保存一张截图
 ```
 
-**macOS 模拟器** — 零依赖，用系统自带 Cocoa
+`sim/board` 模拟 ESP-IDF、FreeRTOS、CO5300 异步传输、CST9220 触摸和只读 flash
+分区。`make board` 会把每次面板刷新与 Mac 帧缓冲逐像素对照。
+
+最新验证结果：
+
+```text
+System Software 7.5.3 启动成功
+4861 个时序钩子通过
+238 次面板传输，0 errors，0 warnings
+主任务栈峰值 3776 / 20480 bytes
+```
+
+## 构建 ESP-Mosaico 固件
+
+ESP-IDF 包装工程位于 `esp-mosaico-vibe/projects/mosaintosh`。在 Vibe 工作区执行：
 
 ```sh
-make app && open build/MosaiMac.app
+python mosaico.py iris system-update --project projects/mosaintosh
 ```
 
-拖窗口就能看。和固件共用 `src/*.c`，不是另写一份。
+首次安装或分区资源变化时使用 `system-update`。只有应用代码变化且分区表与 ROM/磁盘
+资源完全相同时，才使用 `iris app-update`。
 
-**ESP32-S31**
-
-```sh
-cd platform/esp32s31
-. $IDF_PATH/export.sh
-idf.py set-target esp32s31
-idf.py build flash monitor
-```
-
-或者走 [esp-mosaico-vibe](https://github.com/esp-mosaico/esp-mosaico-vibe) 工作区（同目录的 [mosaico-film](https://github.com/hkgood/mosaico-film) 就是这么做的），能顺带拿到 `mosaico.py project sim` PC 模拟器。
-
-板级初始化用 [esp-mosaico-bsp](https://github.com/esp-mosaico/esp-mosaico-bsp) 的 `bsp_display_new()` / `bsp_touch_new()`。
-
-## 状态
-
-| | |
-|---|---|
-| ROP / CopyBits / Region / GrafPort / 脏矩形回路 | ✅ 主机测试覆盖，3124 checks，ASan + UBSan 干净 |
-| 窗口管理器（拖动 + 损伤回路） | ✅ 主机测试 + 模拟器逐像素校验 |
-| macOS 模拟器 | ✅ `make app`，零依赖；本机无 macOS，未实际运行过 |
-| ESP-IDF 平台层（CO5300 + CST9220 + 推送） | ✅ 编译通过 |
-| `.irisfw` 打包 | ✅ **产出 bundle**，238.7 KB |
-| 上机安装与验证 | ❌ 没有硬件 |
-
-在 [esp-mosaico-vibe](https://github.com/esp-mosaico/esp-mosaico-vibe) 工作区里用 `mosaico.py iris system-update` 打出：
-
-```
-qd_esp32s31-system-update.irisfw    238.7 KB
-  manifest.json         esp-iris-system-update/0.2
-  partition-table.bin   4 KB
-  ota_0.bin             456.5 KB
-```
-
-编译环境：ESP-IDF **v6.2.0**（master @ `7b9cc1ac`，和 workspace 钉的同一 commit），target `esp32s31`，16 MB flash。
-
-**但没有硬件，所以没装过、没跑过。** CO5300 初始化时序、CST9220 坐标校准、偶数对齐窗口在真屏上的行为 —— 三样全部未验证。
-
-这段动画不是录屏。`make sim-frames` 用桌面模拟器驱动一次真实的拖动，导出全部 74 帧，每一帧都是跑在固件同一份 `src/*.c` 上的输出，包括 480×480 面板真实的上下黑边。
-
-## 三条设计要点
-
-**内部 480×320，不缩放。** 480/320 = 1.5，512/342 ≈ 1.497，宽高比本来就一致，省掉整个重采样阶段。
-
-**Region 用 span list。** 原版把 Region 塞进 16 字节做 packed RLE；S31 有 16 MB PSRAM，用内存换可验证性。矩形 Region 仍然零堆分配。
-
-**脏的是区域不是矩形。** 窗口移动的包围盒是**整个窗口**（1 像素拖动也是 40,800 px / 82 KB），按 region 存并切 run 后只要 **818 px / 1.6 KB**。同一块硬件上这就是 46 fps 和拖得动的区别。
-
-细节、实测数据和引擎踩过的坑都在 [docs/DESIGN.md](docs/DESIGN.md)。
+生成的系统更新包包含应用、分区表、128 KB ROM 分区和 8 MB 启动盘分区。本地最新构建
+产物为 `mosaintosh-system-update.irisfw`。
 
 ## 目录
 
 ```text
-include/qd/qd.h      公开 API
-src/                 引擎（可移植 C11）
-test/                主机测试
-bench/               吞吐测量
-sim/                 模拟器：核心 + headless + Cocoa 后端 + .app 打包
-tools/               渲染器、字体、PPM→PNG、API 推送
-platform/esp32s31/   ESP-IDF 工程
-docs/                设计文档 + GitHub Pages
+main/          ESP32-S31 固件：显示、触摸、磁盘与模拟器入口
+host/          headless、自动板级检查和 Cocoa 交互窗口
+sim/board/     ESP-Mosaico / ESP-IDF / FreeRTOS 主机模拟层
+external/umac/ Macintosh Plus 模拟器与 Musashi 68000 核心
+tools/         系统盘裁剪与截图转换
+docs/          GitHub Pages
 ```
 
----
+## 许可
 
-[Apache-2.0](LICENSE) · 2026 · Apple、Macintosh、QuickDraw 是 Apple Inc. 的商标，本项目与其无关联。QuickDraw 是根据可观察行为重新实现的，未使用任何 Apple 源码。
+Mosaintosh 使用 GPL-3.0-or-later。第三方组件及其许可证见
+[THIRD_PARTY.md](THIRD_PARTY.md)。
+
+Macintosh、Mac、System 7 与 Apple 是 Apple Inc. 的商标。本项目与 Apple Inc.
+无关联，不提供任何 Apple ROM 或系统软件。

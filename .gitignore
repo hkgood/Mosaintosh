@@ -1,26 +1,11 @@
-# Host build
+# Apple ROMs and system disks are copyrighted: bring your own, never commit.
+/assets/
+*.rom
+*.ROM
+*.img
+*.dsk
 /build/
-/sim/build/
-sim/**/*.o
-*.o
-/test/test_qd
-/test/test_window
-/bench/bench_qd
-
-# ESP-IDF
-/sdkbuild/
-/managed_components/
-/dependencies.lock
-build/
-sdkconfig
-sdkconfig.old
-*.elf
-*.bin
-*.map
-*.dfu
-
-# Editors
-.vscode/
-.idea/
-*.swp
 .DS_Store
+*.o
+__pycache__/
+/external/umac/main

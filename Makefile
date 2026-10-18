@@ -1,125 +1,121 @@
-# Host build for the qd core.
+# Mosaintosh: a Mac Plus on the ESP-Mosaico, host side.
 #
-# The point of building on the host is that we get a correctness reference and
-# a performance baseline without any hardware in the loop. The same sources
-# cross-compile for ESP32-S31 under ESP-IDF; see platform/esp32s31.
-
-CC      ?= gcc
-CFLAGS  ?= -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wshadow -Wconversion -Wsign-conversion \
-           -Wno-sign-conversion -Iinclude
-LDFLAGS ?=
-
-CORE_SRC := src/qd_rop.c src/qd_region.c src/qd_expand.c src/qd_win.c
-CORE_OBJ := $(CORE_SRC:.c=.o)
-
-# Header dependencies. Without these, editing a header leaves stale .o files
-# in place and the tests keep reporting failures that no longer exist -- or,
-# worse, keep passing after a behaviour change. Both directions have bitten.
-HEADERS := $(wildcard include/qd/*.h) src/qd_internal.h
-
-.PHONY: all test bench clean asan render replay sim sim-app sim-asan app
-
-all: test bench
-
-test: test/test_qd test/test_window
-	@./test/test_qd
-	@echo
-	@./test/test_window
-
-bench: bench/bench_qd
-	@./bench/bench_qd
-
-# Regenerate the screenshot used by the README and the GitHub Page. It is
-# drawn by the engine itself, not by a design tool, so the image is evidence
-# that the ROP and region code works rather than a picture of a picture.
-render: build/render
-	@./build/render build/render.ppm
-	@python3 tools/ppm2png.py build/render.ppm docs/assets/img/workspace.png
-	@echo "docs/assets/img/workspace.png regenerated"
-
-build/render: tools/render.c tools/font5x7.c tools/font5x7.h $(CORE_SRC)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Itools -o $@ tools/render.c tools/font5x7.c $(CORE_SRC)
-
-# Drive a real drag through the engine and dump every frame. A still image
-# reads as a screenshot of something running; a drag is the thing itself.
-replay: build/replay
-	@mkdir -p build/frames
-	@rm -f build/frames/*.ppm
-	@./build/replay
-	@python3 tools/frames2gif.py
-
-build/replay: tools/replay.c tools/font5x7.c tools/font5x7.h $(CORE_SRC)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Itools -o $@ tools/replay.c tools/font5x7.c $(CORE_SRC)
-
-# --- simulator ----------------------------------------------------------
+# The emulator is umac (external/umac, with Musashi as its 68000). Everything
+# here builds and runs on the Mac, so the machine can be booted, measured and
+# debugged before any of it goes on the board.
 #
-# The simulator runs the same core sources as the firmware, so a window drag
-# can be iterated on at 60 fps on a Mac instead of at flash-and-pray speed.
+# ROM and disk images are not part of this repository. Put your own in
+# assets/ (ignored by git):
+#   assets/MacPlus-v3.rom   128 KB Mac Plus v3 ROM (checksum 4D1F8172)
+#   assets/System.img       raw, bootable HFS volume
 
-SIM_SRC := sim/sim_core.c tools/font5x7.c $(CORE_SRC)
+CC ?= cc
 
-build/sim_headless: sim/sim_headless.c $(SIM_SRC) $(HEADERS)
+# The machine. 4 MB is a fully expanded Plus and what System 7.5 needs. The
+# screen is the largest square clear of the panel's rounded corners, framed
+# (main/mac_display.h); umac needs the width a multiple of 32 and
+# width*height/8 < 64 KB. Keep in step with projects/mosaintosh's main/CMakeLists.txt.
+MEMSIZE     ?= 4096
+DISP_WIDTH  ?= 416
+DISP_HEIGHT ?= 416
+
+ROM  ?= assets/MacPlus-v3.rom
+DISK ?= assets/System.img
+
+UMAC    := external/umac
+MUSASHI := $(UMAC)/external/Musashi
+
+UMAC_SRC    := $(UMAC)/src/disc.c $(UMAC)/src/main.c $(UMAC)/src/rom.c $(UMAC)/src/scc.c \
+               $(UMAC)/src/via.c
+MUSASHI_SRC := $(MUSASHI)/m68kcpu.c $(MUSASHI)/m68kdasm.c $(MUSASHI)/m68kops.c \
+               $(MUSASHI)/softfloat/softfloat.c
+
+UMAC_FLAGS := -I$(UMAC)/include -I$(MUSASHI) -DMUSASHI_CNF=\"../include/m68kconf.h\" \
+              -DENABLE_DASM=1 -DUMAC_MEMSIZE=$(MEMSIZE) \
+              -DDISP_WIDTH=$(DISP_WIDTH) -DDISP_HEIGHT=$(DISP_HEIGHT)
+CFLAGS ?= -O2 -g
+
+.PHONY: all boot board board-window disk clean
+
+all: build/headless build/board_check
+
+# Musashi generates its opcode tables; umac's own Makefile knows how.
+$(MUSASHI)/m68kops.c:
+	$(MAKE) -C $(UMAC) prepare
+
+build/headless: host/headless.c $(UMAC_SRC) $(MUSASHI_SRC) $(MUSASHI)/m68kops.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isim -Itools -o $@ sim/sim_headless.c $(SIM_SRC)
+	$(CC) $(CFLAGS) $(UMAC_FLAGS) -o $@ host/headless.c $(UMAC_SRC) $(MUSASHI_SRC) -lm
 
-# Every pixel of every frame is compared against an independent full repaint,
-# so this is a test target, not a demo.
-sim: build/sim_headless
-	./build/sim_headless build/sim_frames 60
+# Boot for 60 emulated seconds, screenshot every 5, convert to PNG.
+boot: build/headless
+	@mkdir -p build/boot
+	@rm -f build/boot/*
+	./build/headless -r $(ROM) -d $(DISK) -t 60 -s 5 -o build/boot/shot
+	@python3 tools/pbm2png.py build/boot/*.pbm > /dev/null
 
-# Same run, but keeping every frame: this is the README animation.
-sim-frames: build/sim_headless
-	@rm -rf build/sim_frames
-	./build/sim_headless build/sim_frames 73 1
-	@python3 tools/frames2gif.py
+# --- the firmware on the simulated board -----------------------------------
+#
+# main/ is the firmware. Here it is compiled unchanged against the bundled
+# Mosaico board simulator (fake ESP-IDF, panel, touch and flash partitions),
+# with the same tick rate and main-task stack as the firmware build.
 
-build/sim_asan: sim/sim_headless.c $(SIM_SRC) $(HEADERS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -Isim -Itools \
-	      -o $@ sim/sim_headless.c $(SIM_SRC)
-	ASAN_OPTIONS=detect_leaks=1 ./$@ build/asan_frames 60
+BOARD           := sim/board
+FREERTOS_HZ     ?= 1000
+MAIN_TASK_STACK ?= 20480
 
-sim-asan: build/sim_asan
-	@true   # the recipe above already ran and verified
+# What goes in the macdisk partition: System 7.5.3 trimmed to 8 MB (see
+# tools/trim_variants.sh; variant B keeps the 7.5.1 and 7.5.3 fixes).
+BOARD_DISK ?= build/trim/B.img
 
-build/sim_cocoa: sim/sim_cocoa.m sim/sim_core.c $(CORE_SRC) $(HEADERS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Isim -Itools -framework Cocoa -o $@ \
-	      sim/sim_cocoa.m sim/sim_core.c $(CORE_SRC)
+FW_SRC  := $(wildcard main/*.c)
+FW_HDR  := $(wildcard main/*.h)
+BOARD_HDR := $(wildcard $(BOARD)/*.h $(BOARD)/include/*.h $(BOARD)/include/*/*.h)
 
-sim-app: build/sim_cocoa
+BOARD_FLAGS := $(CFLAGS) -pthread $(UMAC_FLAGS) -Imain -I$(BOARD) -I$(BOARD)/include \
+               -DCONFIG_FREERTOS_HZ=$(FREERTOS_HZ) \
+               -DCONFIG_ESP_MAIN_TASK_STACK_SIZE=$(MAIN_TASK_STACK)
+WARN := -Wall -Wextra -Werror
 
-app:
-	@sim/make_app.sh
+# umac and Musashi are third-party: built once, without our warning flags.
+EMU_OBJ := $(patsubst %.c,build/emu/%.o,$(UMAC_SRC) $(MUSASHI_SRC))
+build/emu/%.o: %.c $(MUSASHI)/m68kops.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(UMAC_FLAGS) -c -o $@ $<
 
-test/test_qd: test/test_qd.c $(CORE_OBJ) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ test/test_qd.c $(CORE_OBJ) $(LDFLAGS)
+FW_OBJ := $(patsubst %.c,build/obj/%.o,$(FW_SRC)) build/obj/board/board.o
+build/obj/main/%.o: main/%.c $(FW_HDR) $(BOARD_HDR)
+	@mkdir -p $(dir $@)
+	$(CC) $(BOARD_FLAGS) $(WARN) -c -o $@ $<
+build/obj/board/board.o: $(BOARD)/board.c $(BOARD_HDR)
+	@mkdir -p $(dir $@)
+	$(CC) $(BOARD_FLAGS) $(WARN) -c -o $@ $<
 
-test/test_window: test/test_window.c $(CORE_OBJ) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ test/test_window.c $(CORE_OBJ) $(LDFLAGS)
+build/board_check: host/board_check.c $(FW_OBJ) $(EMU_OBJ)
+	$(CC) $(BOARD_FLAGS) $(WARN) -o $@ $^ -lm
 
-bench/bench_qd: bench/bench_qd.c $(CORE_OBJ) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ bench/bench_qd.c $(CORE_OBJ) $(LDFLAGS)
+build/obj/board/board_window.o: $(BOARD)/board_window.m $(BOARD)/board.h
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wextra -fobjc-arc -I$(BOARD) -c -o $@ $<
 
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) -c -o $@ $<
+build/board_window: host/board_window.c build/obj/board/board_window.o $(FW_OBJ) $(EMU_OBJ)
+	$(CC) $(BOARD_FLAGS) $(WARN) -framework Cocoa -o $@ $^ -lm
 
-# Sanitised run: the ROP engine does a lot of pointer arithmetic and region
-# code allocates, so this is the build that catches the mistakes the plain
-# build will not.
-asan:
-	$(CC) -O1 -g -std=c11 -D_POSIX_C_SOURCE=200809L \
-	  -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude \
-	  -o /tmp/test_qd_asan test/test_qd.c $(CORE_SRC)
-	@/tmp/test_qd_asan
-	$(CC) -O1 -g -std=c11 -D_POSIX_C_SOURCE=200809L \
-	  -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude \
-	  -o /tmp/test_window_asan test/test_window.c $(CORE_SRC)
-	@/tmp/test_window_asan
+$(BOARD_DISK):
+	bash tools/trim_variants.sh
+
+disk: $(BOARD_DISK)
+
+# Boot to the Finder, open About This Macintosh by touch; screenshots in
+# build/check/.
+board: build/board_check $(BOARD_DISK)
+	@mkdir -p build/check
+	@rm -f build/check/*
+	./build/board_check $(ROM) $(BOARD_DISK); status=$$?; \
+	    python3 tools/pbm2png.py build/check/*.ppm > /dev/null; exit $$status
+
+board-window: build/board_window $(BOARD_DISK)
+	./build/board_window $(ROM) $(BOARD_DISK)
 
 clean:
-	rm -rf build
-	rm -f $(CORE_OBJ) test/test_qd test/test_window bench/bench_qd \
-	      /tmp/test_qd_asan /tmp/test_window_asan
+	rm -rf build/headless* build/board_* build/obj build/emu build/boot build/check
